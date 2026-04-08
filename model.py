@@ -82,8 +82,8 @@ if __name__ == "__main__":
     print(model)
     print(f"\nParametri totali: {sum(p.numel() for p in model.parameters()):,}")
 
-    dummy = torch.randn(16, 5)
+    dummy = torch.randn(16, 6)
     out = model(dummy)
     print(f"\nInput:  {dummy.shape}")
-    print(f"Output: {out.shape}  -> valori ET0 (tutti positivi per Softplus)")
+    print(f"Output: {out.shape}  -> valori ET0 (mm/giorno, non-negativita' applicata con np.maximum in post-processing)")
     print(f"Output esempio: {out[:4].detach().numpy().flatten()}")
