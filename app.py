@@ -162,6 +162,18 @@ with st.sidebar:
         st.markdown("**Risultati training**")
         st.image(str(PLOT_FILE), caption="ET0 Reale vs Predetta (test set)")
 
+    st.divider()
+    st.header("💧 Sensore Suolo (IoT)")
+    st.caption("Simula lettura sensore FDR/TDR a 30 cm")
+    umidita_suolo = st.slider("Umidità suolo (%)", 5.0, 95.0, 35.0, step=1.0,
+                              help="Lettura sensore FDR/TDR a 30 cm di profondità")
+    campo_cap     = st.slider("Capacità di campo (%)", 30.0, 70.0, 45.0, step=0.5,
+                              help="Massima acqua ritenuta dopo drenaggio libero")
+    punto_app     = st.slider("Punto appassimento (%)", 5.0, 30.0, 18.0, step=0.5,
+                              help="Minima acqua disponibile per le piante")
+    if punto_app >= campo_cap:
+        st.error("Punto appassimento deve essere < Capacità di campo!")
+
 # ---------------------------------------------------------------------------
 # Pannello principale — Inputs
 # ---------------------------------------------------------------------------
@@ -272,6 +284,82 @@ ax.set_xlim(1, 365)
 plt.tight_layout()
 st.pyplot(fig)
 plt.close(fig)
+
+# ---------------------------------------------------------------------------
+# Sezione sensore suolo e irrigazione (Aggiornamenti 1 #2)
+# ---------------------------------------------------------------------------
+
+st.markdown("---")
+st.markdown("### 💧 Sensore Suolo IoT — Raccomandazione Irrigazione")
+st.caption("Simulazione sensore FDR/TDR a 30 cm | Coltura: Mais (Kc = 0.90)")
+
+Kc_mais       = 0.90
+PROFONDITA_MM = 400.0   # zona radicale 40 cm -> 400 mm strato attivo
+
+ad_totale  = max(campo_cap - punto_app, 1.0)       # Acqua Disponibile totale (%)
+ad_attuale = max(umidita_suolo - punto_app, 0.0)   # AD attuale (%)
+ad_pct     = ad_attuale / ad_totale * 100.0         # % AD riempita
+
+deficit_pct = max(campo_cap - umidita_suolo, 0.0)
+dose_mm     = deficit_pct / 100.0 * PROFONDITA_MM  # dose per tornare a CC (mm)
+
+# Deplezione giornaliera: ET0 * Kc * fattore stress idrico (Ks)
+Ks        = min(ad_attuale / max(ad_totale * 0.50, 1.0), 1.0)
+deplez_gg = max(et0_hs * Kc_mais * Ks, 0.1)        # mm/giorno
+ad_mm     = ad_attuale / 100.0 * PROFONDITA_MM      # AD in mm
+giorni_ap = ad_mm / deplez_gg if deplez_gg > 0 else 99.0
+
+col_s1, col_s2, col_s3 = st.columns(3)
+col_s1.metric("Riserva idrica", f"{ad_pct:.0f}%",
+              help="% acqua disponibile nel profilo (100% = capacità di campo)")
+col_s2.metric("Dose irrigua consigliata", f"{dose_mm:.0f} mm",
+              help="Acqua necessaria per riportare il suolo a capacità di campo")
+col_s3.metric("Giorni al punto di appassimento", f"{min(giorni_ap, 99):.1f} gg",
+              help="Stima giorni alla soglia critica con deplezione ET0×Kc×Ks")
+
+st.progress(min(ad_pct / 100.0, 1.0), text=f"Riserva idrica: {ad_pct:.0f}%")
+
+if giorni_ap < 2:
+    st.error("🚨 IRRIGARE IMMEDIATAMENTE — Rischio appassimento in meno di 2 giorni!")
+elif giorni_ap < 5:
+    st.warning(f"⚠️ Pianifica irrigazione entro {giorni_ap:.0f} giorni. "
+               f"Deficit attuale: {deficit_pct:.1f}%")
+elif dose_mm < 5:
+    st.success("✅ Suolo ben idratato — nessuna irrigazione necessaria nelle prossime 5 gg.")
+else:
+    st.info(f"ℹ️ Programma irrigazione tra {max(giorni_ap - 3, 1):.0f}–{giorni_ap:.0f} giorni. "
+            f"Dose stimata: {dose_mm:.0f} mm.")
+
+# Mini-chart: proiezione umidita 7 giorni
+giorni_sim = np.arange(0, 8)
+umid_sim   = np.maximum(umidita_suolo - deplez_gg * giorni_sim, punto_app)
+
+fig2, ax2 = plt.subplots(figsize=(10, 2.8))
+ax2.fill_between(giorni_sim, umid_sim, punto_app,
+                 where=umid_sim > punto_app,
+                 color="#4CAF50", alpha=0.30, label="Acqua disponibile")
+ax2.fill_between(giorni_sim, umid_sim, punto_app,
+                 where=umid_sim <= punto_app,
+                 color="#EF5350", alpha=0.30, label="Sotto appassimento")
+ax2.plot(giorni_sim, umid_sim, color="#1565C0", linewidth=2.2,
+         marker="o", markersize=5)
+ax2.axhline(campo_cap, color="#2196F3", linestyle="--", linewidth=1.2,
+            label=f"Cap. di campo ({campo_cap:.0f}%)")
+ax2.axhline(punto_app, color="#B71C1C", linestyle=":",  linewidth=1.2,
+            label=f"Punto appass. ({punto_app:.0f}%)")
+ax2.set_xlabel("Giorni da oggi", fontsize=9)
+ax2.set_ylabel("Umidità suolo (%)", fontsize=9)
+ax2.set_title(
+    f"Proiezione umidità suolo — 7 giorni "
+    f"(ET0={et0_hs:.2f} mm/gg, Kc={Kc_mais}, Ks={Ks:.2f})",
+    fontsize=10
+)
+ax2.legend(fontsize=8, ncol=2)
+ax2.grid(True, alpha=0.3)
+ax2.set_xlim(0, 7)
+plt.tight_layout()
+st.pyplot(fig2)
+plt.close(fig2)
 
 # ---------------------------------------------------------------------------
 # Sezione dataset
