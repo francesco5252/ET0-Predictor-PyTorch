@@ -58,8 +58,14 @@ def _carica_modello_scaler():
             f"Scaler non trovato: {SCALER_FILE}\n"
             "Esegui prima: python train.py"
         )
-    torch.serialization.add_safe_globals([ET0Predictor])
-    ckpt  = torch.load(str(MODEL_FILE), map_location="cpu", weights_only=True)
+    try:
+        torch.serialization.add_safe_globals([ET0Predictor])
+    except AttributeError:
+        pass  # PyTorch < 2.4: add_safe_globals non disponibile, usa weights_only=False
+    try:
+        ckpt = torch.load(str(MODEL_FILE), map_location="cpu", weights_only=True)
+    except Exception:
+        ckpt = torch.load(str(MODEL_FILE), map_location="cpu")
     model = ET0Predictor(input_dim=ckpt.get("input_dim", 6))
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -68,6 +74,8 @@ def _carica_modello_scaler():
 
 
 def _leggi_parametri_base(giorno: int) -> dict:
+    if not (1 <= giorno <= 365):
+        raise ValueError(f"giorno deve essere tra 1 e 365, ricevuto: {giorno}")
     if not DATA_FILE.exists():
         return {
             "T_max_C": 30.0,
@@ -90,6 +98,8 @@ def _leggi_parametri_base(giorno: int) -> dict:
 
 
 def _genera_griglia(base: dict, n_rows: int = N_ROWS, n_cols: int = N_COLS) -> np.ndarray:
+    if n_rows <= 1 or n_cols <= 1:
+        raise ValueError(f"n_rows e n_cols devono essere > 1, ricevuti: {n_rows}, {n_cols}")
     rows_idx = np.repeat(np.arange(n_rows), n_cols)
     cols_idx = np.tile(np.arange(n_cols), n_rows)
     row_norm = rows_idx / (n_rows - 1)
@@ -128,13 +138,14 @@ def genera_vra(giorno: int = 180, soglia_stress: float = None,
     model, scaler = _carica_modello_scaler()
     base          = _leggi_parametri_base(giorno)
     grid          = _genera_griglia(base)
+    n_rows_eff, n_cols_eff = N_ROWS, N_COLS  # coerente con _genera_griglia default
 
     X_sc = scaler.transform(grid)
     with torch.no_grad():
         et0_flat = model(torch.tensor(X_sc, dtype=torch.float32))
         et0_flat = np.maximum(et0_flat.numpy().flatten(), 0.0)
 
-    et0_grid = et0_flat.reshape(N_ROWS, N_COLS)
+    et0_grid = et0_flat.reshape(n_rows_eff, n_cols_eff)
 
     media = float(et0_flat.mean())
     std   = float(et0_flat.std())
@@ -171,9 +182,9 @@ def genera_vra(giorno: int = 180, soglia_stress: float = None,
     )
     ax.set_xlabel("Longitudine (W -> E)", fontsize=9)
     ax.set_ylabel("Latitudine (N -> S)", fontsize=9)
-    ax.set_xticks([0, 24, 49])
+    ax.set_xticks([0, N_COLS // 2, N_COLS - 1])
     ax.set_xticklabels(["Ovest", "Centro", "Est"], fontsize=8)
-    ax.set_yticks([0, 24, 49])
+    ax.set_yticks([0, N_ROWS // 2, N_ROWS - 1])
     ax.set_yticklabels(["Nord", "Centro", "Sud"], fontsize=8)
     plt.tight_layout()
 
