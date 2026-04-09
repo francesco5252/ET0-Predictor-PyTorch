@@ -80,6 +80,8 @@ def _carica_dati_benchmark():
 
     df     = pd.read_excel(str(DATA_FILE), sheet_name="Dati_Meteo_Giornalieri")
     df_ben = df.tail(N_BENCH_DAYS).reset_index(drop=True)
+    if len(df_ben) < N_BENCH_DAYS:
+        print(f"[edge] Attenzione: dataset ha solo {len(df_ben)} righe (richieste {N_BENCH_DAYS})")
     scaler = joblib.load(str(SCALER_FILE))
 
     X_raw = df_ben[FEATURE_NAMES].values.astype(np.float32)
@@ -118,7 +120,7 @@ if __name__ == "__main__":
     print("[edge] Quantizzazione Dynamic Int8...")
     model_int8 = _quantizza(model_fp32)
 
-    torch.save(model_int8.state_dict(), str(OUTPUT_INT8))
+    torch.save(model_int8, str(OUTPUT_INT8))
     print(f"[edge] Salvato -> {OUTPUT_INT8.name}")
 
     print(f"\n[edge] Caricamento {N_BENCH_DAYS} giorni di test...")
