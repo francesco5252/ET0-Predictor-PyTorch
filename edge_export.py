@@ -25,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-from model import ET0Predictor
+from model import ET0Predictor  # noqa: E402
 
 MODEL_FILE    = ROOT / "model_et0.pth"
 SCALER_FILE   = ROOT / "scaler_X.pkl"

@@ -1,220 +1,167 @@
-"""
-vra_irrigazione.py
-------------------
-Aggiornamento 3: VRA (Variable Rate Application) — Mappa di Prescrizione Irrigazione
-
-Genera una griglia spaziale 50x50 (2500 celle) che rappresenta un campo di 500m x 500m
-nella Pianura Padana. Ogni cella riceve variazioni realistiche di microclima.
-La rete neurale ET0Predictor elabora tutte le 2500 celle in batch -> heatmap ET0.
-
-CLI:
-    python vra_irrigazione.py
-    python vra_irrigazione.py --giorno 210 --soglia-stress 5.0
-
-Output:
-    vra_heatmap.png  (se output_path non e' None)
-"""
-
-import sys
-import os
 import argparse
+import sys
 import time
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
 import joblib
-from pathlib import Path
 
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-from model import ET0Predictor
+from model import ET0Predictor  # noqa: E402
+from generate_dataset import calcola_Ra  # noqa: E402
 
 MODEL_FILE  = ROOT / "model_et0.pth"
 SCALER_FILE = ROOT / "scaler_X.pkl"
-DATA_FILE   = ROOT / "dati_meteo_agricoli.xlsx"
 OUTPUT_PNG  = ROOT / "vra_heatmap.png"
 
-FEATURE_NAMES = [
-    "T_max_C", "T_min_C", "Umidita_Relativa_%",
-    "Rad_Solare_MJ_m2", "Rad_Extraterr_MJ_m2", "Velocita_Vento_m_s"
-]
+class VRAIrrigationSimulator:
+    """
+    Simulatore per Variable Rate Application (VRA) dell'irrigazione.
+    Genera un campo agricolo sintetico 2D con variabilita' microclimatica
+    locale e utilizza la rete neurale per inferire la mappa ET0 ad alta risoluzione.
+    """
+    
+    def __init__(self, grid_dim: int = 50, cell_size: int = 10, giorno: int = 210, soglia_stress: float = 5.0):
+        self.grid_dim = grid_dim
+        self.cell_size = cell_size
+        self.giorno = giorno
+        self.soglia_stress = soglia_stress
+        self.n_celle = self.grid_dim * self.grid_dim
 
-N_ROWS = 50
-N_COLS = 50
+        print(f"\n[1/4] Inizializzazione VRA Simulatore — Campo {self.grid_dim}x{self.grid_dim}")
+        self._carica_modello_scaler()
 
+    def _carica_modello_scaler(self):
+        """Carica la rete neurale PyTorch e lo scaler pre-addestrato."""
+        if not SCALER_FILE.exists() or not MODEL_FILE.exists():
+            raise FileNotFoundError("Mancano model_et0.pth o scaler_X.pkl. Esegui prima train.py!")
 
-def _carica_modello_scaler():
-    if not MODEL_FILE.exists():
-        raise RuntimeError(
-            f"Modello non trovato: {MODEL_FILE}\n"
-            "Esegui prima: python train.py"
-        )
-    if not SCALER_FILE.exists():
-        raise RuntimeError(
-            f"Scaler non trovato: {SCALER_FILE}\n"
-            "Esegui prima: python train.py"
-        )
-    try:
-        torch.serialization.add_safe_globals([ET0Predictor])
-    except AttributeError:
-        pass  # PyTorch < 2.4: add_safe_globals non disponibile, usa weights_only=False
-    try:
-        ckpt = torch.load(str(MODEL_FILE), map_location="cpu", weights_only=True)
-    except Exception:
-        ckpt = torch.load(str(MODEL_FILE), map_location="cpu")
-    model = ET0Predictor(input_dim=ckpt.get("input_dim", 6))
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-    scaler = joblib.load(str(SCALER_FILE))
-    return model, scaler
+        self.scaler = joblib.load(SCALER_FILE)
+        self.model = ET0Predictor(input_dim=6)
+        
+        checkpoint = torch.load(MODEL_FILE, map_location="cpu", weights_only=True)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.model.eval()
 
+    def _leggi_parametri_base(self):
+        """Temperatura ed umidita' di base per il giorno dell'anno."""
+        t_max_base = 32.0 + 3 * np.sin(2 * np.pi * self.giorno / 365)
+        t_min_base = 20.0 + 2 * np.sin(2 * np.pi * self.giorno / 365)
+        ur_base    = 50.0 - 10 * np.cos(2 * np.pi * self.giorno / 365)
+        rad_base   = 22.0
+        vento_base = 2.0
+        return t_max_base, t_min_base, ur_base, rad_base, vento_base
+        
+    def _genera_griglia(self):
+        """Genera i tensori 2D di rumorosita' microclimatica tramite random walk."""
+        x = np.linspace(0, 10, self.grid_dim)
+        y = np.linspace(0, 10, self.grid_dim)
+        Xg, Yg = np.meshgrid(x, y)
 
-def _leggi_parametri_base(giorno: int) -> dict:
-    if not (1 <= giorno <= 365):
-        raise ValueError(f"giorno deve essere tra 1 e 365, ricevuto: {giorno}")
-    if not DATA_FILE.exists():
-        return {
-            "T_max_C": 30.0,
-            "T_min_C": 18.0,
-            "Umidita_Relativa_%": 55.0,
-            "Rad_Solare_MJ_m2": 22.0,
-            "Rad_Extraterr_MJ_m2": 38.0,
-            "Velocita_Vento_m_s": 2.0,
+        elevazione = np.sin(Xg*0.5) * np.cos(Yg*0.5)
+        lai = np.sin(Xg*0.8 + 2) * np.sin(Yg*0.8)
+
+        t_max_noise = elevazione * 1.5 - lai * 0.5 
+        t_min_noise = elevazione * 0.8
+        ur_noise    = lai * 5.0 - elevazione * 3.0
+        
+        return t_max_noise, t_min_noise, ur_noise
+
+    def genera_vra(self):
+        """
+        Calcola la mappa di prescrizione idrica, restituendo Figure e Statistiche.
+        """
+        t_max_base, t_min_base, ur_base, rad_base, vento_base = self._leggi_parametri_base()
+        t_max_noise, t_min_noise, ur_noise = self._genera_griglia()
+        
+        T_max_2d = t_max_base + t_max_noise
+        T_min_2d = t_min_base + t_min_noise
+        UR_2d    = np.clip(ur_base + ur_noise, 5.0, 100.0)
+        
+        Ra_scalar = float(calcola_Ra(np.array([self.giorno]))[0])
+
+        T_max_flat = T_max_2d.flatten()
+        T_min_flat = T_min_2d.flatten()
+        UR_flat    = UR_2d.flatten()
+        
+        X_batch = np.column_stack([
+            T_max_flat,
+            T_min_flat,
+            UR_flat,
+            np.full(self.n_celle, rad_base),
+            np.full(self.n_celle, Ra_scalar),
+            np.full(self.n_celle, vento_base)
+        ]).astype(np.float32)
+        
+        print("\n[3/4] Inferenza Rete Neurale...")
+        t0 = time.time()
+        X_scaled = self.scaler.transform(X_batch)
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+        
+        with torch.no_grad():
+            pred_flat = self.model(X_tensor).numpy().flatten()
+            
+        ET0_flat = np.maximum(pred_flat, 0.0)
+        infer_time = time.time() - t0
+        print(f"      Processate {self.n_celle} celle in {infer_time*1000:.1f} ms")
+
+        ET0_2d = ET0_flat.reshape(self.grid_dim, self.grid_dim)
+        
+        dose_irrigua = ET0_2d * 1.2
+        dose_flat = dose_irrigua.flatten()
+        
+        celle_stress = np.sum(dose_flat > self.soglia_stress)
+        percentuale_stress = (celle_stress / self.n_celle) * 100
+
+        fig, ax = plt.subplots(figsize=(8, 7))
+        im = ax.imshow(dose_irrigua, cmap="YlGnBu", origin="lower",
+                       extent=[0, self.grid_dim * self.cell_size, 0, self.grid_dim * self.cell_size])
+        
+        ax.set_title(f"Mappa VRA - Giorno {self.giorno} (Risoluzione {self.cell_size}m)", fontsize=14, pad=15)
+        ax.set_xlabel("Coord X (m)")
+        ax.set_ylabel("Coord Y (m)")
+        
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Fabbisogno Idrico Stimato (mm/gg)", rotation=270, labelpad=15)
+
+        stats = {
+            "et0_min": float(ET0_2d.min()),
+            "et0_max": float(ET0_2d.max()),
+            "et0_mean": float(ET0_2d.mean()),
+            "perc_stress": float(percentuale_stress),
+            "dose_media": float(dose_irrigua.mean())
         }
-    df = pd.read_excel(str(DATA_FILE), sheet_name="Dati_Meteo_Giornalieri")
-    for _candidate in ("DOY", "Giorno_Anno", "giorno_anno"):
-        if _candidate in df.columns:
-            doy_col = _candidate
-            break
-    else:
-        doy_col = df.columns[0]
-    idx = (df[doy_col] - giorno).abs().idxmin()
-    row = df.loc[idx]
-    return {feat: float(row[feat]) for feat in FEATURE_NAMES}
+        
+        textstr = (
+            f"ET0 Media: {stats['et0_mean']:.2f} mm\n"
+            f"Min: {stats['et0_min']:.2f} mm | Max: {stats['et0_max']:.2f} mm\n"
+            f"Zone critiche (>{self.soglia_stress}mm): {stats['perc_stress']:.1f}%"
+        )
+        props = dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray')
+        ax.text(0.03, 0.96, textstr, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=props)
 
-
-def _genera_griglia(base: dict, n_rows: int = N_ROWS, n_cols: int = N_COLS) -> np.ndarray:
-    if n_rows <= 1 or n_cols <= 1:
-        raise ValueError(f"n_rows e n_cols devono essere > 1, ricevuti: {n_rows}, {n_cols}")
-    rows_idx = np.repeat(np.arange(n_rows), n_cols)
-    cols_idx = np.tile(np.arange(n_cols), n_rows)
-    row_norm = rows_idx / (n_rows - 1)
-    col_norm = cols_idx / (n_cols - 1)
-    delta_t = -0.5 + row_norm * 1.0
-    dist_nw = np.sqrt(row_norm**2 + col_norm**2) / np.sqrt(2)
-    delta_vento = (1.0 - dist_nw) * 0.3
-    delta_umid = 5.0 * np.exp(-((row_norm - 0.5)**2) / (2 * 0.1**2))
-    grid = np.column_stack([
-        np.full(n_rows * n_cols, base["T_max_C"])             + delta_t,
-        np.full(n_rows * n_cols, base["T_min_C"])             + delta_t,
-        np.clip(
-            np.full(n_rows * n_cols, base["Umidita_Relativa_%"]) + delta_umid,
-            10.0, 100.0
-        ),
-        np.full(n_rows * n_cols, base["Rad_Solare_MJ_m2"]),
-        np.full(n_rows * n_cols, base["Rad_Extraterr_MJ_m2"]),
-        np.clip(
-            np.full(n_rows * n_cols, base["Velocita_Vento_m_s"]) + delta_vento,
-            0.0, 15.0
-        ),
-    ]).astype(np.float32)
-    return grid
-
-
-def genera_vra(giorno: int = 180, soglia_stress: float = None,
-               output_path=OUTPUT_PNG):
-    """
-    Ritorna (fig, stats).
-    stats = {
-        "et0_min": float, "et0_max": float, "et0_mean": float, "et0_std": float,
-        "n_celle_stress": int, "pct_stress": float, "soglia": float,
-    }
-    Salva PNG solo se output_path is not None.
-    """
-    model, scaler = _carica_modello_scaler()
-    base          = _leggi_parametri_base(giorno)
-    grid          = _genera_griglia(base)
-    n_rows_eff, n_cols_eff = N_ROWS, N_COLS  # coerente con _genera_griglia default
-
-    X_sc = scaler.transform(grid)
-    with torch.no_grad():
-        et0_flat = model(torch.tensor(X_sc, dtype=torch.float32))
-        et0_flat = np.maximum(et0_flat.numpy().flatten(), 0.0)
-
-    et0_grid = et0_flat.reshape(n_rows_eff, n_cols_eff)
-
-    media = float(et0_flat.mean())
-    std   = float(et0_flat.std())
-    if soglia_stress is None:
-        soglia_stress = media + std
-
-    n_stress = int(np.sum(et0_flat > soglia_stress))
-    pct      = n_stress / len(et0_flat) * 100.0
-
-    stats = {
-        "et0_min": float(et0_flat.min()),
-        "et0_max": float(et0_flat.max()),
-        "et0_mean": media,
-        "et0_std": std,
-        "n_celle_stress": n_stress,
-        "pct_stress": pct,
-        "soglia": soglia_stress,
-    }
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(
-        et0_grid, cmap="RdYlGn_r", origin="upper",
-        aspect="equal", interpolation="bilinear",
-    )
-    ax.contour(et0_grid, levels=[soglia_stress],
-               colors=["white"], linewidths=[1.5], linestyles=["--"])
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("ET0 (mm/giorno)", fontsize=10)
-    ax.set_title(
-        f"Mappa VRA — ET0 Neurale (mm/g) | Giorno {giorno}\n"
-        f"Media: {media:.2f} | Soglia stress: {soglia_stress:.2f} | "
-        f"Zone critiche: {pct:.1f}%",
-        fontsize=11,
-    )
-    ax.set_xlabel("Longitudine (W -> E)", fontsize=9)
-    ax.set_ylabel("Latitudine (N -> S)", fontsize=9)
-    ax.set_xticks([0, N_COLS // 2, N_COLS - 1])
-    ax.set_xticklabels(["Ovest", "Centro", "Est"], fontsize=8)
-    ax.set_yticks([0, N_ROWS // 2, N_ROWS - 1])
-    ax.set_yticklabels(["Nord", "Centro", "Sud"], fontsize=8)
-    plt.tight_layout()
-
-    if output_path is not None:
-        fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
-
-    return fig, stats
-
+        return fig, stats
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VRA Irrigazione — Mappa ET0 spaziale")
-    parser.add_argument("--giorno", type=int, default=180,
-                        help="Giorno dell'anno (1-365, default: 180)")
-    parser.add_argument("--soglia-stress", type=float, default=None,
-                        help="Soglia ET0 zona stress mm/g (default: media+1std)")
+    parser = argparse.ArgumentParser(description="Variable Rate Application (VRA) Heatmap con PyTorch")
+    parser.add_argument("--giorno", type=int, default=210, help="Giorno dell'anno (default: 210 = fine luglio)")
+    parser.add_argument("--dim", type=int, default=50, help="Dimensione griglia NxN (default: 50)")
+    parser.add_argument("--soglia-stress", type=float, default=5.0, dest="soglia_stress", 
+                        help="Soglia ET0 per considerare la cella in stress idrico")
     args = parser.parse_args()
 
-    print("[vra] Generazione griglia 50x50 (2500 celle)...")
-    t0 = time.perf_counter()
-    fig, stats = genera_vra(
-        giorno=args.giorno,
-        soglia_stress=args.soglia_stress,
-        output_path=OUTPUT_PNG,
-    )
-    plt.close(fig)
-    elapsed = time.perf_counter() - t0
+    simulator = VRAIrrigationSimulator(grid_dim=args.dim, giorno=args.giorno, soglia_stress=args.soglia_stress)
+    fig, stats = simulator.genera_vra()
 
-    print(f"[vra] ET0 media: {stats['et0_mean']:.2f} mm/g | "
-          f"Min: {stats['et0_min']:.2f} | Max: {stats['et0_max']:.2f}")
-    print(f"[vra] Zone stress (ET0 > {stats['soglia']:.2f}): "
-          f"{stats['n_celle_stress']} celle ({stats['pct_stress']:.1f}%)")
-    print(f"[vra] Tempo inference: {elapsed*1000:.0f} ms")
-    print(f"[vra] Salvata -> {OUTPUT_PNG.name}")
+    fig.savefig(OUTPUT_PNG, dpi=120, bbox_inches="tight")
+    print(f"\n[4/4] Mappa calcolata e salvata -> '{OUTPUT_PNG}'")
+    print("-" * 50)
+    print(f"Fabbisogno medio del campo : {stats['dose_media']:.2f} mm")
+    print(f"Celle in zona critica      : {stats['perc_stress']:.1f}% (> {args.soglia_stress} mm)")

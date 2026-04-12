@@ -10,8 +10,9 @@ Confronto in tempo reale tra:
 Avvio: streamlit run app.py
 """
 
-import os
 import subprocess
+import requests
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
@@ -187,28 +188,73 @@ with st.sidebar:
 
 with tab1:
     st.markdown("---")
-    st.markdown("### 🎛️ Parametri Meteorologici")
-    st.caption("Inserisci i dati del giorno per calcolare ET0 con entrambi i metodi.")
+    st.markdown("### 🌦️ Previsioni Meteo Real-Time (Open-Meteo Satellite)")
+    st.caption("Estrai le previsioni meteo reali a 7 giorni per la tua zona agricola tramite API.")
+    
+    col_api1, col_api2, col_api3 = st.columns([2, 2, 2])
+    with col_api1:
+        lat_input = st.number_input("Latitudine (°N)", value=44.49, format="%.4f")
+    with col_api2:
+        lon_input = st.number_input("Longitudine (°E)", value=11.34, format="%.4f")
+    with col_api3:
+        st.write("")
+        fetch_api = st.button("🔄 Scarica Dati Satellite", use_container_width=True)
+
+    if "meteo_data" not in st.session_state:
+        st.session_state["meteo_data"] = None
+
+    if fetch_api:
+        with st.spinner("Connessione cloud satellitare in corso..."):
+            try:
+                url = f"https://api.open-meteo.com/v1/forecast?latitude={lat_input}&longitude={lon_input}&daily=temperature_2m_max,temperature_2m_min,shortwave_radiation_sum,wind_speed_10m_max,et0_fao_evapotranspiration&timezone=Europe/Rome"
+                r = requests.get(url, timeout=5)
+                if r.status_code == 200:
+                    st.session_state["meteo_data"] = r.json()
+                    st.success("Previsioni scaricate con successo!")
+                else:
+                    st.error(f"Errore REST 🌐: {r.status_code}")
+            except Exception as e:
+                st.error(f"Connessione fallita: {e}")
+
+    # Impostazioni di default calcolate dal giorno e meteo
+    oggi_gg = datetime.now().timetuple().tm_yday
+    def_tmax = 32.0
+    def_tmin = 20.0
+    def_rad = 22.0
+    def_vento = 2.5
+    
+    if st.session_state["meteo_data"]:
+        daily_d = st.session_state["meteo_data"]["daily"]
+        def_tmax = float(daily_d["temperature_2m_max"][0])
+        def_tmin = float(daily_d["temperature_2m_min"][0])
+        def_rad = float(daily_d["shortwave_radiation_sum"][0])
+        def_vento = float(daily_d["wind_speed_10m_max"][0])
+
+    st.markdown("### 🎛️ Parametri Misurazione Odierna (Giorno 1)")
+    st.caption("Modificabili manualmente. Modelli aggiornati in base al cloud se connesso.")
 
     col_left, col_right = st.columns([3, 2])
 
     with col_left:
         c1, c2, c3 = st.columns(3)
         with c1:
-            giorno = st.slider("📅 Giorno anno", 1, 365, 197,
-                               help="1 = 1° Gen | 197 = 16° Lug | 365 = 31° Dic")
-            t_max  = st.slider("🌡️ T max (°C)", -10.0, 45.0, 32.0, step=0.5)
-            t_min  = st.slider("🌡️ T min (°C)", -15.0, 35.0, 20.0, step=0.5)
+            giorno = st.slider("📅 Giorno anno", 1, 365, oggi_gg)
+            t_max  = st.slider("🌡️ T max (°C)", -10.0, 45.0, def_tmax, step=0.5)
+            t_min  = st.slider("🌡️ T min (°C)", -15.0, 35.0, def_tmin, step=0.5)
         with c2:
             umid    = st.slider("💧 Umidità rel. (%)", 10.0, 100.0, 45.0, step=1.0)
-            rad_sol = st.slider("☀️ Rad. Solare (MJ/m²)", 0.0, 35.0, 22.0, step=0.5)
-            vento   = st.slider("💨 Vento (m/s)", 0.0, 12.0, 2.5, step=0.1)
+            rad_sol = st.slider("☀️ Rad. Solare (MJ/m²)", 0.0, 35.0, def_rad, step=0.5)
+            vento   = st.slider("💨 Vento (m/s)", 0.0, 12.0, def_vento, step=0.1)
         with c3:
             ra = calcola_Ra(giorno)
-            st.markdown("**📡 Rad. Extraterr. (Ra)**")
-            st.info(f"**{ra:.2f}** MJ/m²/giorno\n\n_(calcolata automaticamente\nper lat. 45°N, giorno {giorno})_")
+            st.markdown("**📡 Rad. Extraterr.**")
+            st.info(f"**{ra:.2f}** MJ/m²")
+            
+            if st.session_state["meteo_data"]:
+                st.markdown("**🌍 ET0 FAO-56 Ufficiale**")
+                et0_f_real = float(st.session_state["meteo_data"]["daily"]["et0_fao_evapotranspiration"][0])
+                st.success(f"**{et0_f_real:.2f}** mm/gg")
 
-            # Validazione temperatura
             if t_min >= t_max:
                 st.error("⚠️ T_min deve essere < T_max")
 
@@ -292,6 +338,38 @@ with tab1:
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
+    if st.session_state.get("meteo_data") and model_nn is not None:
+        st.markdown("### 🚀 Forecasting Predittivo ET0 a 7 Giorni (Dati Cloud)")
+        st.caption("Il modello AI stima il consumo idrico dei prossimi 7 giorni elaborando le previsioni Open-Meteo in tempo reale.")
+        
+        daily = st.session_state["meteo_data"]["daily"]
+        dates = [d[5:] for d in daily["time"]] # format MM-DD
+        et0_open = daily["et0_fao_evapotranspiration"]
+        
+        # Predict using our PyTorch model for the next 7 days
+        et0_nn_7d = []
+        for i in range(len(dates)):
+            t_max_i = float(daily["temperature_2m_max"][i])
+            t_min_i = float(daily["temperature_2m_min"][i])
+            rad_i = float(daily["shortwave_radiation_sum"][i])
+            vento_i = float(daily["wind_speed_10m_max"][i])
+            ra_i = calcola_Ra((oggi_gg + i) % 365)
+            # usiamo umidita' costante perche non disponibile giornalmente nell api base
+            et0_nn_i = predici_nn(model_nn, scaler_nn, t_max_i, t_min_i, umid, rad_i, ra_i, vento_i)
+            et0_nn_7d.append(et0_nn_i)
+            
+        fig3, ax3 = plt.subplots(figsize=(12, 3.5))
+        ax3.plot(dates, et0_open, marker="s", color="#8E24AA", label="ET0 Baseline FAO-56 (Satellitare)", linewidth=2.5)
+        ax3.plot(dates, et0_nn_7d, marker="o", color="#FF5722", label="ET0_NN PyTorch Predetta", linewidth=2.5, linestyle="--", alpha=0.9)
+        
+        ax3.set_ylabel("ET0 (mm/giorno)", fontsize=10)
+        ax3.set_title("Forcasting Evapotraspirazione Settimanale", fontsize=11)
+        ax3.legend(fontsize=9)
+        ax3.grid(True, alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig3)
+        plt.close(fig3)
 
     # ---------------------------------------------------------------------------
     # Sezione sensore suolo e irrigazione (Aggiornamenti 1 #2)
